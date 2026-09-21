@@ -7,6 +7,7 @@
 #include "engine/behavior_script.h"
 #include "engine/graph_node.h"
 #include "engine/math_util.h"
+#include "connect_menu.h"
 #include "file_select.h"
 #include "game/area.h"
 #include "game/game_init.h"
@@ -19,6 +20,7 @@
 #include "game/segment7.h"
 #include "game/spawn_object.h"
 #include "sm64.h"
+#include "sm64ap.h"
 #include "text_strings.h"
 
 #include "eu_translation.h"
@@ -1382,6 +1384,13 @@ void check_main_menu_clicked_buttons(void) {
                 s16 buttonY = sMainMenuButtons[buttonID]->oPosY;
 
                 if (check_clicked_button(buttonX, buttonY, 200.0f) == TRUE) {
+                    // A file can only be played if it knows which Archipelago slot to connect to
+                    if (buttonID <= MENU_BUTTON_PLAY_FILE_D
+                        && !SM64AP_CanConnectFromSave(save_file_get_ap_server(buttonID), save_file_get_ap_name(buttonID))) {
+                        play_sound(SOUND_MENU_CAMERA_BUZZ, gDefaultSoundArgs);
+                        connect_menu_show_no_connection_notice();
+                        break;
+                    }
                     // If menu button clicked, select it
                     sMainMenuButtons[buttonID]->oMenuButtonState = MENU_BUTTON_STATE_GROWING;
                     sSelectedButtonID = buttonID;
@@ -1443,6 +1452,18 @@ void check_main_menu_clicked_buttons(void) {
  * is loaded, and that checks what buttonID is clicked in the main menu.
  */
 void bhv_menu_button_manager_loop(void) {
+    // The connect form covers the whole screen, so while it is open (or was open for this click,
+    // since its buttons overlap the ones below) the menu buttons underneath must not react.
+    const s32 connectWasOpen = connect_menu_is_open();
+    if (connectWasOpen || sSelectedButtonID == MENU_BUTTON_NONE) {
+        connect_menu_update(sClickPos[0], sClickPos[1]);
+    }
+    if (connectWasOpen || connect_menu_is_open()) {
+        sClickPos[0] = -10000;
+        sClickPos[1] = -10000;
+        return;
+    }
+
     switch (sSelectedButtonID) {
         case MENU_BUTTON_NONE:
             check_main_menu_clicked_buttons();
@@ -2750,6 +2771,9 @@ static void print_file_select_strings(void) {
             print_sound_mode_menu_strings();
             break;
     }
+    if (sSelectedButtonID == MENU_BUTTON_NONE) {
+        connect_menu_draw(sCursorPos[0], sCursorPos[1]);
+    }
     // If all 4 save file exists, define true to sAllFilesExist to prevent more copies in copy menu
     if (save_file_exists(SAVE_FILE_A) == TRUE && save_file_exists(SAVE_FILE_B) == TRUE &&
         save_file_exists(SAVE_FILE_C) == TRUE && save_file_exists(SAVE_FILE_D) == TRUE) {
@@ -2789,6 +2813,7 @@ s32 lvl_init_menu_values_and_cursor_pos(UNUSED s32 arg, UNUSED s32 unused) {
     sSelectedButtonID = MENU_BUTTON_NONE;
     sCurrentMenuLevel = MENU_LAYER_MAIN;
     sTextBaseAlpha = 0;
+    connect_menu_close();
     // Place the cursor over the save file that was being played.
     // gCurrSaveFileNum is 1 by default when the game boots, as such
     // the cursor will point on Mario A save file.
@@ -2846,5 +2871,11 @@ s32 lvl_init_menu_values_and_cursor_pos(UNUSED s32 arg, UNUSED s32 unused) {
  */
 s32 lvl_update_obj_and_load_file_selected(UNUSED s32 arg, UNUSED s32 unused) {
     area_update_objects();
+    if (sSelectedFileNum != 0) {
+        // The file was chosen, connect to the Archipelago slot saved in it
+        const s32 fileIndex = sSelectedFileNum - 1;
+        SM64AP_ConnectFromSave(save_file_get_ap_server(fileIndex), save_file_get_ap_name(fileIndex),
+                               save_file_get_ap_password(fileIndex));
+    }
     return sSelectedFileNum;
 }
