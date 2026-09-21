@@ -11,6 +11,7 @@
 #include "game/ingame_menu.h"
 #include "game/save_file.h"
 #include "game/segment2.h"
+#include "game/segment7.h"
 #include "pc/text_input.h"
 #include "sm64.h"
 
@@ -21,18 +22,18 @@ void create_dl_scale_matrix(s8 pushOp, f32 x, f32 y, f32 z);
 
 /**
  * @file connect_menu.c
- * Everything here is drawn as flat 2D rectangles and text on top of the file select screen, and is
- * operated either with the keyboard (typing, Tab, Enter, Esc) or with the file select cursor.
+ * The text and input of the connections menu, which is laid out like the score menu: a title, the four
+ * files in a grid and a row of buttons at the bottom. The buttons themselves are objects spawned by
+ * file_select.c, so the rectangles here only have to cover them for the cursor.
  * All rectangles are in screen space (320x240, y pointing down), except for text baselines
  * which, like print_generic_string, are measured from the bottom of the screen.
  *
- * The CONNECTIONS button opens a picker for one of the four files, which then opens a form to
- * create or edit the Archipelago connection saved in that file.
+ * It is operated either with the keyboard (typing, Tab, Enter, Esc) or with the file select cursor.
  */
 
 #define CLICK_NONE (-10000)
 
-// The menu font is drawn at this fraction of its size so more fits in the fields and tiles.
+// The menu font is drawn at this fraction of its size so more fits in the fields.
 #define TEXT_SCALE 0.8f
 // Height of a glyph cell, which sits on top of the baseline.
 #define TEXT_HEIGHT ((s16) (16 * TEXT_SCALE))
@@ -50,19 +51,14 @@ enum Field {
 // Focusable elements of the form: the fields followed by two buttons.
 enum FormFocus {
     FOCUS_SAVE = NUM_FIELDS,
-    FOCUS_BACK,
+    FOCUS_RETURN,
     NUM_FORM_FOCUS,
 };
 
-// Focusable elements of the file picker: the four files followed by a button.
-enum SlotFocus {
-    SLOT_FOCUS_BACK = NUM_SAVE_FILES,
-    NUM_SLOT_FOCUS,
-};
-
-enum Phase {
-    PHASE_SLOT,
-    PHASE_FORM,
+// Focusable elements of the file page: the four files followed by a button.
+enum FilesFocus {
+    FILES_FOCUS_RETURN = NUM_SAVE_FILES,
+    NUM_FILES_FOCUS,
 };
 
 struct Rect {
@@ -79,48 +75,86 @@ static const u8 sFieldMaxLen[NUM_FIELDS] = {
 
 static const char *sFieldLabels[NUM_FIELDS] = { "SERVER", "PORT", "NAME", "PASSWORD" };
 
-// Baselines of the fields and their labels, measured from the bottom of the screen.
-static const s16 sFieldBaseline[NUM_FIELDS] = { 172, 144, 116, 88 };
-
-#define FIELD_X1 108
-#define FIELD_X2 292
-#define FIELD_LABEL_X 16
+#define FIELD_TOP 56
+#define FIELD_PITCH 22
+#define FIELD_HEIGHT 18
+#define FIELD_X1 100
+#define FIELD_X2 280
+#define FIELD_LABEL_X 40
 #define FIELD_TEXT_PAD 6
 
-// The button on the file select screen that opens the picker.
-static const struct Rect sOpenButton = { 226, 26, 300, 48 };
+// The names of the files use the score menu's layout (menu font, y measured from the top).
+static const s16 sFileNameX[2] = { 89, 211 };
+static const s16 sFileNameY[2] = { 62, 105 };
+#define FILE_NAME_WIDTH 62 // the space next to a file button
 
-static const struct Rect sSaveButton = { 40, 180, 140, 204 };
-static const struct Rect sBackButton = { 180, 180, 280, 204 };
-static const struct Rect sSlotBackButton = { 110, 186, 210, 208 };
-static const struct Rect sSlotTiles[NUM_SAVE_FILES] = {
-    { 36, 68, 152, 112 }, { 168, 68, 284, 112 },
-    { 36, 124, 152, 168 }, { 168, 124, 284, 168 },
-};
+// The buttons are objects placed by file_select.c, so where they are on screen is worked out the same way
+// check_clicked_button does it for the other menus: their offset from the button they were spawned by,
+// projected onto the screen, with a size of 50 by 42 pixels.
+#define OFFSET_TO_SCREEN(v) ((v) * 13873 / 100000)
+
+static struct Rect button_rect(s16 offsetX, s16 offsetY) {
+    const s16 centerX = 160 - OFFSET_TO_SCREEN(offsetX);
+    const s16 centerY = 120 - OFFSET_TO_SCREEN(offsetY);
+    struct Rect r = { centerX - 25, centerY - 21, centerX + 25, centerY + 21 };
+    return r;
+}
+
+static struct Rect file_button_rect(s32 i) {
+    return button_rect(CONNECT_BUTTON_FILE_X(i), CONNECT_BUTTON_FILE_Y(i));
+}
+
+static struct Rect return_button_rect(void) {
+    return button_rect(CONNECT_BUTTON_RETURN_X, CONNECT_BUTTON_RETURN_Y);
+}
+
+static struct Rect save_button_rect(void) {
+    return button_rect(CONNECT_BUTTON_SAVE_X, CONNECT_BUTTON_SAVE_Y);
+}
+
+// What can be clicked: a file includes its text next to the button, the bottom buttons include their labels.
+static struct Rect file_area(s32 i) {
+    struct Rect r = file_button_rect(i);
+    r.x2 += FILE_NAME_WIDTH + 8;
+    return r;
+}
+
+static struct Rect bottom_button_area(struct Rect r) {
+    r.y2 = 208;
+    return r;
+}
+
+#define BUTTON_LABEL_BASELINE 35
+
+// The status message goes in the gap between the buttons of the bottom row.
+#define MESSAGE_BASELINE 57
 
 #define NOTICE_FRAMES 90
 
 static const struct Rect sNoticeBox = { 40, 92, 280, 148 };
 
-// Baselines of the status message, which sits in a different gap on each page.
-#define FORM_MESSAGE_BASELINE 64
-#define SLOT_MESSAGE_BASELINE 57
-
 static s32 sOpen = FALSE;
 static s32 sNoticeTimer = 0;
-static enum Phase sPhase = PHASE_SLOT;
+static enum ConnectPage sPage = CONNECT_PAGE_FILES;
 static s32 sFocus = 0;
 static s32 sEditFile = 0; // the file the form is editing
 static char sFields[NUM_FIELDS][AP_SERVER_LEN];
 static char sMessage[40] = "";
 static s32 sMessageIsError = FALSE;
+static u8 sAlpha = 255;
+// The focus is only shown once the keyboard is used, the cursor doesn't need it
+static s32 sFocusVisible = FALSE;
 
 /* helpers */
 
 static struct Rect field_rect(s32 field) {
-    const s16 baseline = sFieldBaseline[field];
-    struct Rect r = { FIELD_X1, 222 - baseline, FIELD_X2, 244 - baseline };
+    struct Rect r = { FIELD_X1, FIELD_TOP + field * FIELD_PITCH, FIELD_X2, FIELD_TOP + field * FIELD_PITCH + FIELD_HEIGHT };
     return r;
+}
+
+// Baseline of the text in a field, which keeps it in the middle of the box.
+static s16 field_baseline(s32 field) {
+    return 224 - (FIELD_TOP + field * FIELD_PITCH);
 }
 
 static s32 rect_contains(const struct Rect *r, s16 x, s16 y) {
@@ -210,6 +244,14 @@ static void draw_box(const struct Rect *r, u8 bgR, u8 bgG, u8 bgB, u8 borderR, u
     draw_rect(r->x1, r->y1, r->x2, r->y2, bgR, bgG, bgB);
 }
 
+// Only the border of a rectangle, to show what has the keyboard focus.
+static void draw_outline(const struct Rect *r) {
+    draw_rect(r->x1, r->y1, r->x2, r->y1 + 2, 255, 255, 255);
+    draw_rect(r->x1, r->y2 - 2, r->x2, r->y2, 255, 255, 255);
+    draw_rect(r->x1, r->y1, r->x1 + 2, r->y2, 255, 255, 255);
+    draw_rect(r->x2 - 2, r->y1, r->x2, r->y2, 255, 255, 255);
+}
+
 static void print_scaled(s16 x, s16 y, const u8 *str) {
     create_dl_translation_matrix(MENU_MTX_PUSH, x, y, 0.0f);
     create_dl_scale_matrix(MENU_MTX_NOPUSH, TEXT_SCALE, TEXT_SCALE, 1.0f);
@@ -219,9 +261,7 @@ static void print_scaled(s16 x, s16 y, const u8 *str) {
 
 static void draw_text(s16 x, s16 y, const u8 *str, u8 r, u8 g, u8 b) {
     gSPDisplayList(gDisplayListHead++, dl_ia_text_begin);
-    gDPSetEnvColor(gDisplayListHead++, 0, 0, 0, 255);
-    print_scaled(x + 1, y - 1, str);
-    gDPSetEnvColor(gDisplayListHead++, r, g, b, 255);
+    gDPSetEnvColor(gDisplayListHead++, r, g, b, sAlpha);
     print_scaled(x, y, str);
     gSPDisplayList(gDisplayListHead++, dl_ia_text_end);
 }
@@ -233,7 +273,7 @@ static void draw_text_centered(s16 centerX, s16 y, const char *str, u8 r, u8 g, 
 }
 
 // Draws the end of a string if it doesn't fit in maxWidth, returns the width that was drawn.
-static s16 draw_text_tail(s16 x, s16 y, const char *str, s16 maxWidth, u8 r, u8 g, u8 b, s32 mask) {
+static s16 draw_text_tail(s16 x, s16 y, const char *str, s16 maxWidth, s32 mask) {
     u8 buf[AP_SERVER_LEN + 1];
     s32 start = 0;
 
@@ -243,54 +283,69 @@ static s16 draw_text_tail(s16 x, s16 y, const char *str, s16 maxWidth, u8 r, u8 
     }
     while (buf[start] != DIALOG_CHAR_TERMINATOR && text_width(buf + start) > maxWidth) start++;
 
-    draw_text(x, y, buf + start, r, g, b);
+    draw_text(x, y, buf + start, 255, 255, 255);
     return text_width(buf + start);
 }
 
-static void draw_button(const struct Rect *r, const char *label, s32 focused, s32 hovered) {
-    const u8 shade = hovered ? 0x30 : 0;
-    // the label sits on the vertical middle of the button (baselines are measured from the bottom)
-    const s16 baseline = 240 - (r->y1 + r->y2) / 2 - TEXT_HEIGHT / 2;
+// Draws the start of a string, cut off if it doesn't fit in maxWidth.
+static void draw_text_head(s16 x, s16 y, const char *str, s16 maxWidth, u8 r, u8 g, u8 b) {
+    u8 buf[AP_SERVER_LEN + 1];
+    s32 len;
 
-    draw_box(r, 0x90 + shade, 0x60 + shade, 0xD0, focused ? 255 : 0x50, focused ? 255 : 0x30, focused ? 255 : 0x90);
-    draw_text_centered((r->x1 + r->x2) / 2, baseline, label, 255, 255, 255);
+    to_dialog(str, buf, sizeof(buf));
+    len = dialog_length(buf);
+    while (len > 0 && text_width(buf) > maxWidth) buf[--len] = DIALOG_CHAR_TERMINATOR;
+    draw_text(x, y, buf, r, g, b);
 }
 
+// The title in the big HUD font, at the same place as the other menus have theirs.
 static void draw_title(const char *title) {
     u8 buf[32];
     to_dialog(title, buf, sizeof(buf));
 
     gSPDisplayList(gDisplayListHead++, dl_rgba16_text_begin);
-    gDPSetEnvColor(gDisplayListHead++, 255, 255, 255, 255);
-    print_hud_lut_string(HUD_LUT_GLOBAL, 160 - (s16) strlen(title) * 6, 25, buf); // the HUD font is 12 wide
+    gDPSetEnvColor(gDisplayListHead++, 255, 255, 255, sAlpha);
+    print_hud_lut_string(HUD_LUT_GLOBAL, 160 - (s16) strlen(title) * 6, 35, buf); // the HUD font is 12 wide
     gSPDisplayList(gDisplayListHead++, dl_rgba16_text_end);
 }
 
-static void draw_message(s16 baseline) {
+static void draw_message(void) {
     if (sMessage[0] == '\0') return;
 
     if (sMessageIsError) {
-        draw_text_centered(160, baseline, sMessage, 255, 120, 120);
+        draw_text_centered(160, MESSAGE_BASELINE, sMessage, 255, 150, 150);
     } else {
-        draw_text_centered(160, baseline, sMessage, 160, 255, 160);
+        draw_text_centered(160, MESSAGE_BASELINE, sMessage, 190, 255, 190);
     }
 }
 
-static void draw_form(s16 cursorX, s16 cursorY) {
+// The labels under the buttons of the bottom row.
+static void draw_button_labels(s32 showSave) {
+    const struct Rect returnButton = return_button_rect();
+    const struct Rect saveButton = save_button_rect();
+
+    draw_text_centered((returnButton.x1 + returnButton.x2) / 2, BUTTON_LABEL_BASELINE, "RETURN", 255, 255, 255);
+    if (showSave) draw_text_centered((saveButton.x1 + saveButton.x2) / 2, BUTTON_LABEL_BASELINE, "SAVE", 255, 255, 255);
+}
+
+static void draw_form(void) {
+    char title[8];
+    snprintf(title, sizeof(title), "MARIO %c", 'A' + sEditFile);
+    draw_title(title);
+
     for (s32 i = 0; i < NUM_FIELDS; i++) {
         const struct Rect r = field_rect(i);
         const s32 focused = (sFocus == i);
-        const s16 baseline = sFieldBaseline[i];
+        const s16 baseline = field_baseline(i);
         u8 label[16];
 
         to_dialog(sFieldLabels[i], label, sizeof(label));
         draw_text(FIELD_LABEL_X, baseline, label, 255, 255, 255);
 
-        draw_box(&r, focused ? 0x50 : 0x30, focused ? 0x2A : 0x18, focused ? 0x88 : 0x58,
-                 focused ? 255 : 0x50, focused ? 255 : 0x30, focused ? 255 : 0x90);
+        draw_box(&r, 0x10, 0x18, 0x28, focused ? 255 : 0x70, focused ? 255 : 0x80, focused ? 255 : 0x90);
 
         const s16 textWidth = draw_text_tail(r.x1 + FIELD_TEXT_PAD, baseline, sFields[i],
-                                             r.x2 - r.x1 - FIELD_TEXT_PAD * 2 - 4, 255, 255, 255, i == FIELD_PASSWORD);
+                                             r.x2 - r.x1 - FIELD_TEXT_PAD * 2 - 4, i == FIELD_PASSWORD);
         if (focused && (gGlobalTimer & 16)) {
             // blinking caret, the font has no underscore
             const s16 caretX = r.x1 + FIELD_TEXT_PAD + textWidth + 1;
@@ -298,42 +353,56 @@ static void draw_form(s16 cursorX, s16 cursorY) {
         }
     }
 
-    draw_button(&sSaveButton, "SAVE", sFocus == FOCUS_SAVE, rect_contains(&sSaveButton, cursorX, cursorY));
-    draw_button(&sBackButton, "BACK", sFocus == FOCUS_BACK, rect_contains(&sBackButton, cursorX, cursorY));
-    draw_message(FORM_MESSAGE_BASELINE);
+    if (sFocus == FOCUS_SAVE) {
+        const struct Rect r = save_button_rect();
+        draw_outline(&r);
+    }
+    if (sFocus == FOCUS_RETURN) {
+        const struct Rect r = return_button_rect();
+        draw_outline(&r);
+    }
+    draw_button_labels(TRUE);
+    draw_message();
 }
 
-static void draw_slot_picker(s16 cursorX, s16 cursorY) {
-    draw_text_centered(160, 180, "CHOOSE A FILE TO EDIT", 255, 255, 255);
-
+static void draw_file_names(void) {
+    // The names use the menu font, like the score menu does
+    gSPDisplayList(gDisplayListHead++, dl_menu_ia8_text_begin);
+    gDPSetEnvColor(gDisplayListHead++, 255, 255, 255, sAlpha);
     for (s32 i = 0; i < NUM_SAVE_FILES; i++) {
-        const struct Rect *r = &sSlotTiles[i];
-        const s32 focused = (sFocus == i);
-        const s32 hovered = rect_contains(r, cursorX, cursorY);
-        const u8 shade = hovered ? 0x30 : 0;
-        const s16 baseline = 240 - (r->y1 + 8) - TEXT_HEIGHT;
-        const char *server = save_file_get_ap_server(i);
-        char name[8];
+        u8 name[8];
+        char text[8];
 
-        draw_box(r, 0x90 + shade, 0x60 + shade, 0xD0, focused ? 255 : 0x50, focused ? 255 : 0x30, focused ? 255 : 0x90);
+        snprintf(text, sizeof(text), "MARIO %c", 'A' + i);
+        to_dialog(text, name, sizeof(name));
+        print_menu_generic_string(sFileNameX[i % 2], sFileNameY[i / 2], name);
+    }
+    gSPDisplayList(gDisplayListHead++, dl_menu_ia8_text_end);
+}
 
-        snprintf(name, sizeof(name), "FILE %c", 'A' + i);
-        draw_text_centered((r->x1 + r->x2) / 2, baseline, name, 255, 255, 255);
-        if (server[0] != '\0') {
-            u8 buf[AP_SERVER_LEN + 1];
-            s32 len;
+static void draw_files(void) {
+    draw_title("CONNECTIONS");
+    draw_file_names();
 
-            to_dialog(server, buf, sizeof(buf));
-            len = dialog_length(buf);
-            while (len > 0 && text_width(buf) > r->x2 - r->x1 - 12) buf[--len] = DIALOG_CHAR_TERMINATOR;
-            draw_text(r->x1 + 6, baseline - 18, buf, 220, 255, 200);
+    // What is saved in each file, where the score menu has the star count
+    for (s32 i = 0; i < NUM_SAVE_FILES; i++) {
+        const char *name = save_file_get_ap_name(i);
+        const s16 x = sFileNameX[i % 2] + 2;
+        const s16 baseline = 240 - (sFileNameY[i / 2] + 14) - TEXT_HEIGHT;
+
+        if (name[0] != '\0') {
+            draw_text_head(x, baseline, name, FILE_NAME_WIDTH, 190, 255, 190);
         } else {
-            draw_text_centered((r->x1 + r->x2) / 2, baseline - 18, "NONE", 200, 180, 240);
+            draw_text_head(x, baseline, "NONE", FILE_NAME_WIDTH, 220, 220, 220);
         }
     }
 
-    draw_button(&sSlotBackButton, "BACK", sFocus == SLOT_FOCUS_BACK, rect_contains(&sSlotBackButton, cursorX, cursorY));
-    draw_message(SLOT_MESSAGE_BASELINE);
+    if (sFocusVisible) {
+        const struct Rect r = (sFocus < NUM_SAVE_FILES) ? file_button_rect(sFocus) : return_button_rect();
+        draw_outline(&r);
+    }
+    draw_button_labels(FALSE);
+    draw_message();
 }
 
 /* input */
@@ -365,15 +434,6 @@ static void load_fields(s32 fileIndex) {
     snprintf(sFields[FIELD_PASSWORD], sizeof(sFields[FIELD_PASSWORD]), "%s", save_file_get_ap_password(fileIndex));
 }
 
-static void open_picker(void) {
-    sOpen = TRUE;
-    sPhase = PHASE_SLOT;
-    sFocus = 0;
-    sMessage[0] = '\0';
-    text_input_set_active(TRUE);
-    play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
-}
-
 static void close_menu(void) {
     sOpen = FALSE;
     text_input_set_active(FALSE);
@@ -382,16 +442,16 @@ static void close_menu(void) {
 
 static void open_form(s32 fileIndex) {
     sEditFile = fileIndex;
-    sPhase = PHASE_FORM;
+    sPage = CONNECT_PAGE_FORM;
     sFocus = FIELD_SERVER;
     sMessage[0] = '\0';
     load_fields(fileIndex);
     play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
 }
 
-// Back to the file picker, with the file that was just edited focused.
-static void back_to_picker(void) {
-    sPhase = PHASE_SLOT;
+// Back to the files, with the file that was just edited focused.
+static void back_to_files(void) {
+    sPage = CONNECT_PAGE_FILES;
     sFocus = sEditFile;
     sMessage[0] = '\0';
     play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
@@ -431,9 +491,9 @@ static void save_to_file(s32 fileIndex) {
     }
     save_file_set_ap_connection(fileIndex, server, sFields[FIELD_NAME], sFields[FIELD_PASSWORD]);
 
-    snprintf(sMessage, sizeof(sMessage), "SAVED FILE %c", 'A' + fileIndex);
+    snprintf(sMessage, sizeof(sMessage), "SAVED MARIO %c", 'A' + fileIndex);
     sMessageIsError = FALSE;
-    sPhase = PHASE_SLOT;
+    sPage = CONNECT_PAGE_FILES;
     sFocus = fileIndex;
     play_sound(SOUND_MENU_STAR_SOUND, gDefaultSoundArgs);
 }
@@ -453,8 +513,8 @@ static void try_save(void) {
     }
 }
 
-static void activate_slot_focus(s32 focus) {
-    if (focus == SLOT_FOCUS_BACK) {
+static void activate_files_focus(s32 focus) {
+    if (focus == FILES_FOCUS_RETURN) {
         close_menu();
     } else {
         open_form(focus);
@@ -462,16 +522,20 @@ static void activate_slot_focus(s32 focus) {
 }
 
 static void move_focus(s32 delta) {
-    const s32 count = (sPhase == PHASE_FORM) ? NUM_FORM_FOCUS : NUM_SLOT_FOCUS;
+    const s32 count = (sPage == CONNECT_PAGE_FORM) ? NUM_FORM_FOCUS : NUM_FILES_FOCUS;
 
     sFocus = (sFocus + delta + count) % count;
     play_sound(SOUND_MENU_CHANGE_SELECT, gDefaultSoundArgs);
 }
 
 static void handle_key(const struct TextInputEvent *ev) {
+    // On the files page the focus isn't shown until the keyboard is first used, and that first key only shows it
+    const s32 focusWasVisible = sFocusVisible || (sPage == CONNECT_PAGE_FORM);
+    sFocusVisible = TRUE;
+
     switch (ev->type) {
         case TEXT_INPUT_CHAR:
-            if (sPhase == PHASE_FORM) {
+            if (sPage == CONNECT_PAGE_FORM) {
                 if (sFocus < NUM_FIELDS) append_char(sFocus, ev->ch);
             } else if (ev->ch >= 'a' && ev->ch <= 'd') {
                 open_form(ev->ch - 'a');
@@ -483,26 +547,26 @@ static void handle_key(const struct TextInputEvent *ev) {
             break;
 
         case TEXT_INPUT_BACKSPACE:
-            if (sPhase == PHASE_FORM && sFocus < NUM_FIELDS) delete_char(sFocus);
+            if (sPage == CONNECT_PAGE_FORM && sFocus < NUM_FIELDS) delete_char(sFocus);
             break;
 
         case TEXT_INPUT_TAB:
         case TEXT_INPUT_DOWN:
         case TEXT_INPUT_RIGHT:
-            move_focus(1);
+            if (focusWasVisible) move_focus(1);
             break;
 
         case TEXT_INPUT_SHIFT_TAB:
         case TEXT_INPUT_UP:
         case TEXT_INPUT_LEFT:
-            move_focus(-1);
+            if (focusWasVisible) move_focus(-1);
             break;
 
         case TEXT_INPUT_ENTER:
-            if (sPhase == PHASE_SLOT) {
-                activate_slot_focus(sFocus);
-            } else if (sFocus == FOCUS_BACK) {
-                back_to_picker();
+            if (sPage == CONNECT_PAGE_FILES) {
+                if (focusWasVisible) activate_files_focus(sFocus);
+            } else if (sFocus == FOCUS_RETURN) {
+                back_to_files();
             } else if (sFocus == FIELD_PASSWORD || sFocus == FOCUS_SAVE) {
                 try_save();
             } else {
@@ -511,8 +575,8 @@ static void handle_key(const struct TextInputEvent *ev) {
             break;
 
         case TEXT_INPUT_ESCAPE:
-            if (sPhase == PHASE_FORM) {
-                back_to_picker();
+            if (sPage == CONNECT_PAGE_FORM) {
+                back_to_files();
             } else {
                 close_menu();
             }
@@ -521,7 +585,12 @@ static void handle_key(const struct TextInputEvent *ev) {
 }
 
 static void handle_click(s16 x, s16 y) {
-    if (sPhase == PHASE_FORM) {
+    const struct Rect returnArea = bottom_button_area(return_button_rect());
+    const struct Rect saveArea = bottom_button_area(save_button_rect());
+
+    sFocusVisible = FALSE;
+
+    if (sPage == CONNECT_PAGE_FORM) {
         for (s32 i = 0; i < NUM_FIELDS; i++) {
             const struct Rect r = field_rect(i);
             if (rect_contains(&r, x, y)) {
@@ -530,19 +599,20 @@ static void handle_click(s16 x, s16 y) {
                 return;
             }
         }
-        if (rect_contains(&sSaveButton, x, y)) {
+        if (rect_contains(&saveArea, x, y)) {
             try_save();
-        } else if (rect_contains(&sBackButton, x, y)) {
-            back_to_picker();
+        } else if (rect_contains(&returnArea, x, y)) {
+            back_to_files();
         }
     } else {
         for (s32 i = 0; i < NUM_SAVE_FILES; i++) {
-            if (rect_contains(&sSlotTiles[i], x, y)) {
+            const struct Rect fileArea = file_area(i);
+            if (rect_contains(&fileArea, x, y)) {
                 open_form(i);
                 return;
             }
         }
-        if (rect_contains(&sSlotBackButton, x, y)) {
+        if (rect_contains(&returnArea, x, y)) {
             close_menu();
         }
     }
@@ -554,10 +624,23 @@ s32 connect_menu_is_open(void) {
     return sOpen;
 }
 
+void connect_menu_open(void) {
+    sOpen = TRUE;
+    sPage = CONNECT_PAGE_FILES;
+    sFocus = 0;
+    sFocusVisible = FALSE;
+    sMessage[0] = '\0';
+    text_input_set_active(TRUE);
+}
+
 void connect_menu_close(void) {
     sOpen = FALSE;
     sNoticeTimer = 0;
     text_input_set_active(FALSE);
+}
+
+s32 connect_menu_get_page(void) {
+    return sPage;
 }
 
 void connect_menu_show_no_connection_notice(void) {
@@ -569,11 +652,7 @@ void connect_menu_update(s16 clickX, s16 clickY) {
     const s16 x = cursor_to_screen_x(clickX);
     const s16 y = cursor_to_screen_y(clickY);
 
-    if (!sOpen) {
-        if (sNoticeTimer > 0) sNoticeTimer--;
-        if (clicked && rect_contains(&sOpenButton, x, y)) open_picker();
-        return;
-    }
+    if (!sOpen) return;
 
     struct TextInputEvent ev;
     while (sOpen && text_input_pop(&ev)) {
@@ -582,28 +661,23 @@ void connect_menu_update(s16 clickX, s16 clickY) {
     if (sOpen && clicked) handle_click(x, y);
 }
 
-void connect_menu_draw(f32 cursorX, f32 cursorY) {
-    const s16 x = cursor_to_screen_x(cursorX);
-    const s16 y = cursor_to_screen_y(cursorY);
+void connect_menu_draw(UNUSED f32 cursorX, UNUSED f32 cursorY, u8 alpha) {
+    sAlpha = alpha;
 
     if (!sOpen) {
-        draw_button(&sOpenButton, "CONNECTIONS", FALSE, rect_contains(&sOpenButton, x, y));
         if (sNoticeTimer > 0) {
-            draw_box(&sNoticeBox, 0x60, 0x30, 0xA0, 255, 255, 255);
-            draw_text_centered(160, 116, "NO CONNECTION SAVED", 255, 120, 120);
-            draw_text_centered(160, 98, "USE CONNECTIONS FIRST", 255, 255, 255);
+            sNoticeTimer--;
+            sAlpha = 255;
+            draw_box(&sNoticeBox, 0x30, 0x30, 0x60, 255, 255, 255);
+            draw_text_centered(160, 116, "NO CONNECTION SAVED", 255, 150, 150);
+            draw_text_centered(160, 98, "USE CONNECT FIRST", 255, 255, 255);
         }
         return;
     }
 
-    draw_rect(0, 0, 320, 240, 0x60, 0x30, 0xA0);
-    if (sPhase == PHASE_SLOT) {
-        draw_title("CONNECTIONS");
-        draw_slot_picker(x, y);
+    if (sPage == CONNECT_PAGE_FILES) {
+        draw_files();
     } else {
-        char title[8];
-        snprintf(title, sizeof(title), "FILE %c", 'A' + sEditFile);
-        draw_title(title);
-        draw_form(x, y);
+        draw_form();
     }
 }
