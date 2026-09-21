@@ -258,9 +258,7 @@ static bool gfx_sdl_text_input_key(const SDL_KeyboardEvent *key) {
             if (ctrl) {
                 char *clip = SDL_GetClipboardText();
                 if (clip) {
-                    for (const char *c = clip; *c; c++) {
-                        text_input_push(TEXT_INPUT_CHAR, *c); // non-printable characters are dropped by the queue
-                    }
+                    text_input_push_utf8(clip);
                     SDL_free(clip);
                 }
             }
@@ -282,9 +280,7 @@ static void gfx_sdl_handle_events(void) {
                 gfx_sdl_onkeydown(event.key.keysym.scancode);
                 break;
             case SDL_TEXTINPUT:
-                for (const char *c = event.text.text; *c; c++) {
-                    text_input_push(TEXT_INPUT_CHAR, *c);
-                }
+                text_input_push_utf8(event.text.text);
                 break;
             case SDL_KEYUP:
                 gfx_sdl_onkeyup(event.key.keysym.scancode);

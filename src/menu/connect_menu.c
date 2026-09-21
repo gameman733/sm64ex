@@ -139,6 +139,7 @@ static enum ConnectPage sPage = CONNECT_PAGE_FILES;
 static s32 sFocus = 0;
 static s32 sEditFile = 0; // the file the form is editing
 static char sFields[NUM_FIELDS][AP_SERVER_LEN];
+static s32 sFieldTooLong[NUM_FIELDS]; // something typed or pasted didn't fit and was left out
 static char sMessage[40] = "";
 static s32 sMessageIsError = FALSE;
 static u8 sAlpha = 255;
@@ -193,7 +194,7 @@ static s32 dialog_length(const u8 *str) {
 }
 
 // The menu font only has letters, digits and a bit of punctuation. Everything else shows up as '?'
-// (the stored text is still exactly what was typed).
+// (the stored text is still exactly what was typed or pasted).
 static u8 ascii_to_dialog(char c) {
     if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
         return ASCII_TO_DIALOG(c);
@@ -218,10 +219,19 @@ static u8 ascii_to_dialog(char c) {
     }
 }
 
+// Converts UTF-8 text. A character that isn't ASCII becomes a single '?', however many bytes it takes.
 static void to_dialog(const char *src, u8 *dst, size_t dstSize) {
-    size_t i;
-    for (i = 0; src[i] != '\0' && i < dstSize - 1; i++) {
-        dst[i] = ascii_to_dialog(src[i]);
+    const unsigned char *s = (const unsigned char *) src;
+    size_t i = 0;
+
+    while (*s != '\0' && i < dstSize - 1) {
+        if (*s < 0x80) {
+            dst[i++] = ascii_to_dialog(*s++);
+        } else {
+            dst[i++] = ascii_to_dialog('?');
+            s++;
+            while ((*s & 0xC0) == 0x80) s++; // the rest of the bytes of this character
+        }
     }
     dst[i] = DIALOG_CHAR_TERMINATOR;
 }
@@ -419,6 +429,7 @@ static void load_fields(s32 fileIndex) {
     }
 
     memset(sFields, 0, sizeof(sFields));
+    memset(sFieldTooLong, 0, sizeof(sFieldTooLong));
     if (server[0] == '\0') {
         snprintf(sFields[FIELD_SERVER], sizeof(sFields[FIELD_SERVER]), "%s", DEFAULT_SERVER);
         return;
@@ -457,21 +468,58 @@ static void back_to_files(void) {
     play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
 }
 
-static void append_char(s32 field, char c) {
+// Writes a code point as UTF-8 and returns how many bytes it took (1 to 4).
+static s32 encode_utf8(u32 codepoint, char *out) {
+    if (codepoint < 0x80) {
+        out[0] = codepoint;
+        return 1;
+    } else if (codepoint < 0x800) {
+        out[0] = 0xC0 | (codepoint >> 6);
+        out[1] = 0x80 | (codepoint & 0x3F);
+        return 2;
+    } else if (codepoint < 0x10000) {
+        out[0] = 0xE0 | (codepoint >> 12);
+        out[1] = 0x80 | ((codepoint >> 6) & 0x3F);
+        out[2] = 0x80 | (codepoint & 0x3F);
+        return 3;
+    }
+    out[0] = 0xF0 | (codepoint >> 18);
+    out[1] = 0x80 | ((codepoint >> 12) & 0x3F);
+    out[2] = 0x80 | ((codepoint >> 6) & 0x3F);
+    out[3] = 0x80 | (codepoint & 0x3F);
+    return 4;
+}
+
+// The fields hold UTF-8 and are limited in bytes. A character that doesn't fit is left out whole, never cut in half.
+static void append_codepoint(s32 field, u32 codepoint) {
+    char bytes[4];
     const size_t len = strlen(sFields[field]);
+    s32 count;
 
-    if (len >= sFieldMaxLen[field]) return;
-    if (field == FIELD_PORT && (c < '0' || c > '9')) return;
+    if (field == FIELD_PORT && (codepoint < '0' || codepoint > '9')) return;
 
-    sFields[field][len] = c;
-    sFields[field][len + 1] = '\0';
+    count = encode_utf8(codepoint, bytes);
+    if (len + count > sFieldMaxLen[field]) {
+        if (field != FIELD_PORT) sFieldTooLong[field] = TRUE;
+        return;
+    }
+
+    memcpy(sFields[field] + len, bytes, count);
+    sFields[field][len + count] = '\0';
     sMessage[0] = '\0';
 }
 
+// Removes the last character, which can be several bytes.
 static void delete_char(s32 field) {
-    const size_t len = strlen(sFields[field]);
+    size_t len = strlen(sFields[field]);
 
-    if (len > 0) sFields[field][len - 1] = '\0';
+    if (len > 0) {
+        do {
+            len--;
+        } while (len > 0 && (sFields[field][len] & 0xC0) == 0x80); // step back over the continuation bytes
+        sFields[field][len] = '\0';
+    }
+    sFieldTooLong[field] = FALSE;
     sMessage[0] = '\0';
 }
 
@@ -508,6 +556,12 @@ static void try_save(void) {
         show_error("PORT MUST BE 1 TO 65535", FIELD_PORT);
     } else if (sFields[FIELD_NAME][0] == '\0') {
         show_error("ENTER A NAME", FIELD_NAME);
+    } else if (sFieldTooLong[FIELD_SERVER]) {
+        show_error("SERVER TOO LONG", FIELD_SERVER);
+    } else if (sFieldTooLong[FIELD_NAME]) {
+        show_error("NAME TOO LONG", FIELD_NAME);
+    } else if (sFieldTooLong[FIELD_PASSWORD]) {
+        show_error("PASSWORD TOO LONG", FIELD_PASSWORD);
     } else {
         save_to_file(sEditFile);
     }
@@ -536,13 +590,13 @@ static void handle_key(const struct TextInputEvent *ev) {
     switch (ev->type) {
         case TEXT_INPUT_CHAR:
             if (sPage == CONNECT_PAGE_FORM) {
-                if (sFocus < NUM_FIELDS) append_char(sFocus, ev->ch);
-            } else if (ev->ch >= 'a' && ev->ch <= 'd') {
-                open_form(ev->ch - 'a');
-            } else if (ev->ch >= 'A' && ev->ch <= 'D') {
-                open_form(ev->ch - 'A');
-            } else if (ev->ch >= '1' && ev->ch <= '4') {
-                open_form(ev->ch - '1');
+                if (sFocus < NUM_FIELDS) append_codepoint(sFocus, ev->codepoint);
+            } else if (ev->codepoint >= 'a' && ev->codepoint <= 'd') {
+                open_form(ev->codepoint - 'a');
+            } else if (ev->codepoint >= 'A' && ev->codepoint <= 'D') {
+                open_form(ev->codepoint - 'A');
+            } else if (ev->codepoint >= '1' && ev->codepoint <= '4') {
+                open_form(ev->codepoint - '1');
             }
             break;
 

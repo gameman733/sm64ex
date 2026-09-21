@@ -22,7 +22,7 @@ enum TextInputEventType {
 
 struct TextInputEvent {
     enum TextInputEventType type;
-    char ch; // printable ASCII, only set for TEXT_INPUT_CHAR
+    unsigned int codepoint; // Unicode code point, only set for TEXT_INPUT_CHAR
 };
 
 // While text input is active the window backend routes typed characters and editing keys
@@ -31,7 +31,11 @@ void text_input_set_active(bool active);
 bool text_input_is_active(void);
 
 // Called by the window backend. Ignored while text input is inactive.
-void text_input_push(enum TextInputEventType type, char ch);
+void text_input_push(enum TextInputEventType type, unsigned int codepoint);
+
+// Pushes every character of a UTF-8 string (typed text or the clipboard) as a TEXT_INPUT_CHAR.
+// Control characters (newlines, tabs, ...) and invalid UTF-8 are skipped.
+void text_input_push_utf8(const char *utf8);
 
 // Returns false once the queue is empty.
 bool text_input_pop(struct TextInputEvent *ev);
