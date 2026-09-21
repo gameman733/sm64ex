@@ -25,6 +25,9 @@ void create_dl_scale_matrix(s8 pushOp, f32 x, f32 y, f32 z);
  * operated either with the keyboard (typing, Tab, Enter, Esc) or with the file select cursor.
  * All rectangles are in screen space (320x240, y pointing down), except for text baselines
  * which, like print_generic_string, are measured from the bottom of the screen.
+ *
+ * The CONNECTIONS button opens a picker for one of the four files, which then opens a form to
+ * create or edit the Archipelago connection saved in that file.
  */
 
 #define CLICK_NONE (-10000)
@@ -51,15 +54,15 @@ enum FormFocus {
     NUM_FORM_FOCUS,
 };
 
-// Focusable elements of the slot picker: the four files followed by a button.
+// Focusable elements of the file picker: the four files followed by a button.
 enum SlotFocus {
     SLOT_FOCUS_BACK = NUM_SAVE_FILES,
     NUM_SLOT_FOCUS,
 };
 
 enum Phase {
-    PHASE_FORM,
     PHASE_SLOT,
+    PHASE_FORM,
 };
 
 struct Rect {
@@ -84,12 +87,12 @@ static const s16 sFieldBaseline[NUM_FIELDS] = { 172, 144, 116, 88 };
 #define FIELD_LABEL_X 16
 #define FIELD_TEXT_PAD 6
 
-// The button on the file select screen that opens the form.
-static const struct Rect sOpenButton = { 230, 26, 300, 48 };
+// The button on the file select screen that opens the picker.
+static const struct Rect sOpenButton = { 226, 26, 300, 48 };
 
 static const struct Rect sSaveButton = { 40, 180, 140, 204 };
 static const struct Rect sBackButton = { 180, 180, 280, 204 };
-static const struct Rect sSlotBackButton = { 110, 180, 210, 204 };
+static const struct Rect sSlotBackButton = { 110, 186, 210, 208 };
 static const struct Rect sSlotTiles[NUM_SAVE_FILES] = {
     { 36, 68, 152, 112 }, { 168, 68, 284, 112 },
     { 36, 124, 152, 168 }, { 168, 124, 284, 168 },
@@ -97,13 +100,18 @@ static const struct Rect sSlotTiles[NUM_SAVE_FILES] = {
 
 #define NOTICE_FRAMES 90
 
-static const struct Rect sNoticeBox = { 48, 92, 272, 148 };
+static const struct Rect sNoticeBox = { 40, 92, 280, 148 };
+
+// Baselines of the status message, which sits in a different gap on each page.
+#define FORM_MESSAGE_BASELINE 64
+#define SLOT_MESSAGE_BASELINE 57
 
 static s32 sOpen = FALSE;
 static s32 sNoticeTimer = 0;
-static enum Phase sPhase = PHASE_FORM;
-static s32 sFocus = FIELD_SERVER;
-static char sFields[NUM_FIELDS][AP_SERVER_LEN] = { DEFAULT_SERVER, "", "", "" };
+static enum Phase sPhase = PHASE_SLOT;
+static s32 sFocus = 0;
+static s32 sEditFile = 0; // the file the form is editing
+static char sFields[NUM_FIELDS][AP_SERVER_LEN];
 static char sMessage[40] = "";
 static s32 sMessageIsError = FALSE;
 
@@ -239,19 +247,6 @@ static s16 draw_text_tail(s16 x, s16 y, const char *str, s16 maxWidth, u8 r, u8 
     return text_width(buf + start);
 }
 
-// Draws the start of a string, cut off if it doesn't fit in maxWidth.
-static void draw_text_head(s16 x, s16 y, const char *str, s16 maxWidth, u8 r, u8 g, u8 b) {
-    u8 buf[AP_SERVER_LEN + 1];
-    s32 len;
-
-    to_dialog(str, buf, sizeof(buf));
-    len = dialog_length(buf);
-    while (len > 0 && text_width(buf) > maxWidth) {
-        buf[--len] = DIALOG_CHAR_TERMINATOR;
-    }
-    draw_text(x, y, buf, r, g, b);
-}
-
 static void draw_button(const struct Rect *r, const char *label, s32 focused, s32 hovered) {
     const u8 shade = hovered ? 0x30 : 0;
     // the label sits on the vertical middle of the button (baselines are measured from the bottom)
@@ -271,13 +266,13 @@ static void draw_title(const char *title) {
     gSPDisplayList(gDisplayListHead++, dl_rgba16_text_end);
 }
 
-static void draw_message(void) {
+static void draw_message(s16 baseline) {
     if (sMessage[0] == '\0') return;
 
     if (sMessageIsError) {
-        draw_text_centered(160, 64, sMessage, 255, 120, 120);
+        draw_text_centered(160, baseline, sMessage, 255, 120, 120);
     } else {
-        draw_text_centered(160, 64, sMessage, 160, 255, 160);
+        draw_text_centered(160, baseline, sMessage, 160, 255, 160);
     }
 }
 
@@ -305,10 +300,11 @@ static void draw_form(s16 cursorX, s16 cursorY) {
 
     draw_button(&sSaveButton, "SAVE", sFocus == FOCUS_SAVE, rect_contains(&sSaveButton, cursorX, cursorY));
     draw_button(&sBackButton, "BACK", sFocus == FOCUS_BACK, rect_contains(&sBackButton, cursorX, cursorY));
+    draw_message(FORM_MESSAGE_BASELINE);
 }
 
 static void draw_slot_picker(s16 cursorX, s16 cursorY) {
-    draw_text_centered(160, 180, "SAVE TO WHICH FILE?", 255, 255, 255);
+    draw_text_centered(160, 180, "CHOOSE A FILE TO EDIT", 255, 255, 255);
 
     for (s32 i = 0; i < NUM_SAVE_FILES; i++) {
         const struct Rect *r = &sSlotTiles[i];
@@ -337,22 +333,67 @@ static void draw_slot_picker(s16 cursorX, s16 cursorY) {
     }
 
     draw_button(&sSlotBackButton, "BACK", sFocus == SLOT_FOCUS_BACK, rect_contains(&sSlotBackButton, cursorX, cursorY));
+    draw_message(SLOT_MESSAGE_BASELINE);
 }
 
 /* input */
 
-static void open_form(void) {
+// Fills the form with the connection saved in a file, or with the defaults if it has none.
+static void load_fields(s32 fileIndex) {
+    const char *server = save_file_get_ap_server(fileIndex);
+    const char *colon = strrchr(server, ':');
+    const char *port = colon ? colon + 1 : "";
+    s32 portIsNumber = (port[0] != '\0');
+
+    for (const char *c = port; *c != '\0'; c++) {
+        if (*c < '0' || *c > '9') portIsNumber = FALSE;
+    }
+
+    memset(sFields, 0, sizeof(sFields));
+    if (server[0] == '\0') {
+        snprintf(sFields[FIELD_SERVER], sizeof(sFields[FIELD_SERVER]), "%s", DEFAULT_SERVER);
+        return;
+    }
+
+    if (portIsNumber && strlen(port) <= PORT_MAX_LEN) {
+        snprintf(sFields[FIELD_SERVER], sizeof(sFields[FIELD_SERVER]), "%.*s", (int) (colon - server), server);
+        snprintf(sFields[FIELD_PORT], sizeof(sFields[FIELD_PORT]), "%s", port);
+    } else {
+        snprintf(sFields[FIELD_SERVER], sizeof(sFields[FIELD_SERVER]), "%s", server);
+    }
+    snprintf(sFields[FIELD_NAME], sizeof(sFields[FIELD_NAME]), "%s", save_file_get_ap_name(fileIndex));
+    snprintf(sFields[FIELD_PASSWORD], sizeof(sFields[FIELD_PASSWORD]), "%s", save_file_get_ap_password(fileIndex));
+}
+
+static void open_picker(void) {
     sOpen = TRUE;
-    sPhase = PHASE_FORM;
-    sFocus = FIELD_SERVER;
+    sPhase = PHASE_SLOT;
+    sFocus = 0;
     sMessage[0] = '\0';
     text_input_set_active(TRUE);
     play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
 }
 
-static void close_form(void) {
+static void close_menu(void) {
     sOpen = FALSE;
     text_input_set_active(FALSE);
+    play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
+}
+
+static void open_form(s32 fileIndex) {
+    sEditFile = fileIndex;
+    sPhase = PHASE_FORM;
+    sFocus = FIELD_SERVER;
+    sMessage[0] = '\0';
+    load_fields(fileIndex);
+    play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
+}
+
+// Back to the file picker, with the file that was just edited focused.
+static void back_to_picker(void) {
+    sPhase = PHASE_SLOT;
+    sFocus = sEditFile;
+    sMessage[0] = '\0';
     play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
 }
 
@@ -380,24 +421,6 @@ static void show_error(const char *msg, s32 focus) {
     play_sound(SOUND_MENU_CAMERA_BUZZ, gDefaultSoundArgs);
 }
 
-// Checks the form and moves on to picking the file to save it to.
-static void try_save(void) {
-    const s32 port = atoi(sFields[FIELD_PORT]);
-
-    if (sFields[FIELD_SERVER][0] == '\0') {
-        show_error("ENTER A SERVER", FIELD_SERVER);
-    } else if (sFields[FIELD_PORT][0] != '\0' && (port < 1 || port > 65535)) {
-        show_error("PORT MUST BE 1 TO 65535", FIELD_PORT);
-    } else if (sFields[FIELD_NAME][0] == '\0') {
-        show_error("ENTER A NAME", FIELD_NAME);
-    } else {
-        sPhase = PHASE_SLOT;
-        sFocus = 0;
-        sMessage[0] = '\0';
-        play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
-    }
-}
-
 static void save_to_file(s32 fileIndex) {
     char server[AP_SERVER_LEN];
 
@@ -408,25 +431,33 @@ static void save_to_file(s32 fileIndex) {
     }
     save_file_set_ap_connection(fileIndex, server, sFields[FIELD_NAME], sFields[FIELD_PASSWORD]);
 
-    snprintf(sMessage, sizeof(sMessage), "SAVED TO FILE %c", 'A' + fileIndex);
+    snprintf(sMessage, sizeof(sMessage), "SAVED FILE %c", 'A' + fileIndex);
     sMessageIsError = FALSE;
-    sPhase = PHASE_FORM;
-    sFocus = FOCUS_SAVE;
+    sPhase = PHASE_SLOT;
+    sFocus = fileIndex;
     play_sound(SOUND_MENU_STAR_SOUND, gDefaultSoundArgs);
 }
 
-static void back_to_form(void) {
-    sPhase = PHASE_FORM;
-    sFocus = FOCUS_SAVE;
-    sMessage[0] = '\0';
-    play_sound(SOUND_MENU_CLICK_FILE_SELECT, gDefaultSoundArgs);
+// Checks the form and saves it to the file being edited.
+static void try_save(void) {
+    const s32 port = atoi(sFields[FIELD_PORT]);
+
+    if (sFields[FIELD_SERVER][0] == '\0') {
+        show_error("ENTER A SERVER", FIELD_SERVER);
+    } else if (sFields[FIELD_PORT][0] != '\0' && (port < 1 || port > 65535)) {
+        show_error("PORT MUST BE 1 TO 65535", FIELD_PORT);
+    } else if (sFields[FIELD_NAME][0] == '\0') {
+        show_error("ENTER A NAME", FIELD_NAME);
+    } else {
+        save_to_file(sEditFile);
+    }
 }
 
 static void activate_slot_focus(s32 focus) {
     if (focus == SLOT_FOCUS_BACK) {
-        back_to_form();
+        close_menu();
     } else {
-        save_to_file(focus);
+        open_form(focus);
     }
 }
 
@@ -443,11 +474,11 @@ static void handle_key(const struct TextInputEvent *ev) {
             if (sPhase == PHASE_FORM) {
                 if (sFocus < NUM_FIELDS) append_char(sFocus, ev->ch);
             } else if (ev->ch >= 'a' && ev->ch <= 'd') {
-                save_to_file(ev->ch - 'a');
+                open_form(ev->ch - 'a');
             } else if (ev->ch >= 'A' && ev->ch <= 'D') {
-                save_to_file(ev->ch - 'A');
+                open_form(ev->ch - 'A');
             } else if (ev->ch >= '1' && ev->ch <= '4') {
-                save_to_file(ev->ch - '1');
+                open_form(ev->ch - '1');
             }
             break;
 
@@ -471,7 +502,7 @@ static void handle_key(const struct TextInputEvent *ev) {
             if (sPhase == PHASE_SLOT) {
                 activate_slot_focus(sFocus);
             } else if (sFocus == FOCUS_BACK) {
-                close_form();
+                back_to_picker();
             } else if (sFocus == FIELD_PASSWORD || sFocus == FOCUS_SAVE) {
                 try_save();
             } else {
@@ -480,10 +511,10 @@ static void handle_key(const struct TextInputEvent *ev) {
             break;
 
         case TEXT_INPUT_ESCAPE:
-            if (sPhase == PHASE_SLOT) {
-                back_to_form();
+            if (sPhase == PHASE_FORM) {
+                back_to_picker();
             } else {
-                close_form();
+                close_menu();
             }
             break;
     }
@@ -502,17 +533,17 @@ static void handle_click(s16 x, s16 y) {
         if (rect_contains(&sSaveButton, x, y)) {
             try_save();
         } else if (rect_contains(&sBackButton, x, y)) {
-            close_form();
+            back_to_picker();
         }
     } else {
         for (s32 i = 0; i < NUM_SAVE_FILES; i++) {
             if (rect_contains(&sSlotTiles[i], x, y)) {
-                save_to_file(i);
+                open_form(i);
                 return;
             }
         }
         if (rect_contains(&sSlotBackButton, x, y)) {
-            back_to_form();
+            close_menu();
         }
     }
 }
@@ -540,7 +571,7 @@ void connect_menu_update(s16 clickX, s16 clickY) {
 
     if (!sOpen) {
         if (sNoticeTimer > 0) sNoticeTimer--;
-        if (clicked && rect_contains(&sOpenButton, x, y)) open_form();
+        if (clicked && rect_contains(&sOpenButton, x, y)) open_picker();
         return;
     }
 
@@ -556,21 +587,23 @@ void connect_menu_draw(f32 cursorX, f32 cursorY) {
     const s16 y = cursor_to_screen_y(cursorY);
 
     if (!sOpen) {
-        draw_button(&sOpenButton, "CONNECT", FALSE, rect_contains(&sOpenButton, x, y));
+        draw_button(&sOpenButton, "CONNECTIONS", FALSE, rect_contains(&sOpenButton, x, y));
         if (sNoticeTimer > 0) {
             draw_box(&sNoticeBox, 0x60, 0x30, 0xA0, 255, 255, 255);
             draw_text_centered(160, 116, "NO CONNECTION SAVED", 255, 120, 120);
-            draw_text_centered(160, 98, "USE CONNECT FIRST", 255, 255, 255);
+            draw_text_centered(160, 98, "USE CONNECTIONS FIRST", 255, 255, 255);
         }
         return;
     }
 
     draw_rect(0, 0, 320, 240, 0x60, 0x30, 0xA0);
-    draw_title("CONNECT");
-    if (sPhase == PHASE_FORM) {
-        draw_form(x, y);
-    } else {
+    if (sPhase == PHASE_SLOT) {
+        draw_title("CONNECTIONS");
         draw_slot_picker(x, y);
+    } else {
+        char title[8];
+        snprintf(title, sizeof(title), "FILE %c", 'A' + sEditFile);
+        draw_title(title);
+        draw_form(x, y);
     }
-    draw_message();
 }

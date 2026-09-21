@@ -5,8 +5,9 @@
 
 #include "types.h"
 
-// Archipelago connection form on the file select screen: a "CONNECT" button that opens a
-// full screen form (server, port, name, password) which can be saved to one of the save files.
+// Archipelago connections on the file select screen: a "CONNECTIONS" button that opens a picker for one
+// of the save files, then a full screen form (server, port, name, password) to create or edit the
+// connection saved in that file.
 
 s32 connect_menu_is_open(void);
 void connect_menu_close(void);
