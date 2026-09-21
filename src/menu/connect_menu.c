@@ -17,6 +17,7 @@
 #if !defined(VERSION_JP) && !defined(VERSION_SH)
 s16 get_string_width(u8 *str);
 #endif
+void create_dl_scale_matrix(s8 pushOp, f32 x, f32 y, f32 z);
 
 /**
  * @file connect_menu.c
@@ -27,6 +28,11 @@ s16 get_string_width(u8 *str);
  */
 
 #define CLICK_NONE (-10000)
+
+// The menu font is drawn at this fraction of its size so more fits in the fields and tiles.
+#define TEXT_SCALE 0.8f
+// Height of a glyph cell, which sits on top of the baseline.
+#define TEXT_HEIGHT ((s16) (16 * TEXT_SCALE))
 
 #define DEFAULT_SERVER "archipelago.gg"
 
@@ -85,8 +91,8 @@ static const struct Rect sSaveButton = { 40, 180, 140, 204 };
 static const struct Rect sBackButton = { 180, 180, 280, 204 };
 static const struct Rect sSlotBackButton = { 110, 180, 210, 204 };
 static const struct Rect sSlotTiles[NUM_SAVE_FILES] = {
-    { 36, 60, 152, 104 }, { 168, 60, 284, 104 },
-    { 36, 116, 152, 160 }, { 168, 116, 284, 160 },
+    { 36, 68, 152, 112 }, { 168, 68, 284, 112 },
+    { 36, 124, 152, 168 }, { 168, 124, 284, 168 },
 };
 
 #define NOTICE_FRAMES 90
@@ -127,13 +133,14 @@ static void set_message(const char *msg, s32 isError) {
     sMessageIsError = isError;
 }
 
+// Width in screen pixels, with TEXT_SCALE applied.
 static s16 text_width(const u8 *str) {
 #if !defined(VERSION_JP) && !defined(VERSION_SH)
-    return get_string_width((u8 *) str);
+    return (s16) (get_string_width((u8 *) str) * TEXT_SCALE);
 #else
     s16 width = 0;
     while (*str++ != DIALOG_CHAR_TERMINATOR) width += 10;
-    return width;
+    return (s16) (width * TEXT_SCALE);
 #endif
 }
 
@@ -195,12 +202,19 @@ static void draw_box(const struct Rect *r, u8 bgR, u8 bgG, u8 bgB, u8 borderR, u
     draw_rect(r->x1, r->y1, r->x2, r->y2, bgR, bgG, bgB);
 }
 
+static void print_scaled(s16 x, s16 y, const u8 *str) {
+    create_dl_translation_matrix(MENU_MTX_PUSH, x, y, 0.0f);
+    create_dl_scale_matrix(MENU_MTX_NOPUSH, TEXT_SCALE, TEXT_SCALE, 1.0f);
+    print_generic_string(0, 0, str);
+    gSPPopMatrix(gDisplayListHead++, G_MTX_MODELVIEW);
+}
+
 static void draw_text(s16 x, s16 y, const u8 *str, u8 r, u8 g, u8 b) {
     gSPDisplayList(gDisplayListHead++, dl_ia_text_begin);
     gDPSetEnvColor(gDisplayListHead++, 0, 0, 0, 255);
-    print_generic_string(x + 1, y - 1, str);
+    print_scaled(x + 1, y - 1, str);
     gDPSetEnvColor(gDisplayListHead++, r, g, b, 255);
-    print_generic_string(x, y, str);
+    print_scaled(x, y, str);
     gSPDisplayList(gDisplayListHead++, dl_ia_text_end);
 }
 
@@ -241,7 +255,7 @@ static void draw_text_head(s16 x, s16 y, const char *str, s16 maxWidth, u8 r, u8
 static void draw_button(const struct Rect *r, const char *label, s32 focused, s32 hovered) {
     const u8 shade = hovered ? 0x30 : 0;
     // the label sits on the vertical middle of the button (baselines are measured from the bottom)
-    const s16 baseline = 240 - (r->y1 + r->y2) / 2 - 8;
+    const s16 baseline = 240 - (r->y1 + r->y2) / 2 - TEXT_HEIGHT / 2;
 
     draw_box(r, 0x90 + shade, 0x60 + shade, 0xD0, focused ? 255 : 0x50, focused ? 255 : 0x30, focused ? 255 : 0x90);
     draw_text_centered((r->x1 + r->x2) / 2, baseline, label, 255, 255, 255);
@@ -285,7 +299,7 @@ static void draw_form(s16 cursorX, s16 cursorY) {
         if (focused && (gGlobalTimer & 16)) {
             // blinking caret, the font has no underscore
             const s16 caretX = r.x1 + FIELD_TEXT_PAD + textWidth + 1;
-            draw_rect(caretX, 240 - baseline - 15, caretX + 2, 240 - baseline, 255, 255, 255);
+            draw_rect(caretX, 240 - baseline - TEXT_HEIGHT, caretX + 2, 240 - baseline, 255, 255, 255);
         }
     }
 
@@ -294,14 +308,14 @@ static void draw_form(s16 cursorX, s16 cursorY) {
 }
 
 static void draw_slot_picker(s16 cursorX, s16 cursorY) {
-    draw_text_centered(160, 190, "SAVE TO WHICH FILE?", 255, 255, 255);
+    draw_text_centered(160, 180, "SAVE TO WHICH FILE?", 255, 255, 255);
 
     for (s32 i = 0; i < NUM_SAVE_FILES; i++) {
         const struct Rect *r = &sSlotTiles[i];
         const s32 focused = (sFocus == i);
         const s32 hovered = rect_contains(r, cursorX, cursorY);
         const u8 shade = hovered ? 0x30 : 0;
-        const s16 baseline = 218 - r->y1;
+        const s16 baseline = 240 - (r->y1 + 8) - TEXT_HEIGHT;
         const char *server = save_file_get_ap_server(i);
         char name[8];
 
@@ -316,9 +330,9 @@ static void draw_slot_picker(s16 cursorX, s16 cursorY) {
             to_dialog(server, buf, sizeof(buf));
             len = dialog_length(buf);
             while (len > 0 && text_width(buf) > r->x2 - r->x1 - 12) buf[--len] = DIALOG_CHAR_TERMINATOR;
-            draw_text(r->x1 + 6, baseline - 20, buf, 220, 255, 200);
+            draw_text(r->x1 + 6, baseline - 18, buf, 220, 255, 200);
         } else {
-            draw_text_centered((r->x1 + r->x2) / 2, baseline - 20, "NONE", 200, 180, 240);
+            draw_text_centered((r->x1 + r->x2) / 2, baseline - 18, "NONE", 200, 180, 240);
         }
     }
 
